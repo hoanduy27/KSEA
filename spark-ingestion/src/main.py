@@ -8,8 +8,9 @@ spark = SparkSession.Builder() \
     .master("local[4]").getOrCreate()
 
 df = spark.read.format('csv').option('header', 'true').load(
-    'spark-ingestion/resource/data.csv')
-
+    'data/training_pool.csv')
+    
+df = df.select([col for col in df.columns if col != 'target'])
 
 df.write.format("org.elasticsearch.spark.sql") \
     .option("es.resource", '%s/%s' % (INDEX_NAME, "doc")) \

@@ -6,7 +6,7 @@ TOPIC = 'test-topic'
 
 producer = KafkaProducer(bootstrap_servers='localhost:9092', value_serializer=lambda v: json.dumps(v).encode('utf-8'))
 
-data = pd.read_csv('kafka-ingestion/resource/data.csv')
+data = pd.read_csv('data/test.csv')
 
 json_array = data.to_dict('records')
 
