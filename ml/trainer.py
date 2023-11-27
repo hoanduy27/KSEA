@@ -20,12 +20,22 @@ from modAL.models import ActiveLearner
 from ml.preprocess import feature_extraction
 
 from pyspark.sql import SparkSession
+from elasticsearch import Elasticsearch
 
+
+QUERY_AMOUNT = 10000
+TEST_INDEX = 'test-kakfa-ingestion-flow/_doc'
+POOL_INDEX = 'spark_index/doc'
+METRIC_INDEX = 'active_learning_performance'
 
 spark = SparkSession.Builder() \
     .appName("data_processor") \
     .config("spark.jars.packages", "org.elasticsearch:elasticsearch-spark-30_2.12:8.6.2") \
     .master("local[4]").getOrCreate()
+
+es = Elasticsearch("http://localhost:9200")
+es.indices.create(index=METRIC_INDEX, ignore=400)
+
 
 
 tolist_udf = F.udf(lambda v: v.toArray().tolist(), ArrayType(FloatType()))
@@ -58,8 +68,8 @@ class Trainer:
         self.val_size = val_size
         
         (
-            self.X_train, self.X_val, 
-            self.y_train, self.y_val, 
+            self.X, self.X_train, self.X_val, 
+            self.y, self.y_train, self.y_val, 
         ) = self._split_dataset()
 
         self.hparams = None 
@@ -76,7 +86,7 @@ class Trainer:
             random_state=7
         )
 
-        return (X_train, X_val, y_train, y_val)
+        return (X, X_train, X_val, y, y_train, y_val)
     
     # Core function to train a model given train set and params
     def train_model(self, params, X_train, y_train):
@@ -127,17 +137,16 @@ class Trainer:
         self.hparams = best_params
         self.model = final_model
 
-
 class Strategy:
     def __init__(
             self, 
-            labeled_df: DataFrame, 
-            unlabeled_df: DataFrame, 
+            df_lab: DataFrame, 
+            df_unlab: DataFrame, 
             labeler: LabelSimulator, 
         ):
         # self.pre_model = pre_model
-        self.labeled_df = labeled_df 
-        self.unlabeled_df = unlabeled_df
+        self.df_lab = df_lab 
+        self.df_unlab = df_unlab
         
         self.labeler = labeler
 
@@ -147,6 +156,9 @@ class Strategy:
         def to_query_(features_series):
             X_i = np.stack(features_series.to_numpy())
             n = X_i.shape[0]
+   
+            if QUERY_FACTOR >= 1:
+                return pd.Series([True] * n)
             
             query_idx, _ = learner.query(X_i, n_instances=math.ceil(n * QUERY_FACTOR))
             # Output has same size of inputs; most instances were not sampled for query
@@ -157,33 +169,37 @@ class Strategy:
         
         return to_query_(features_series)
 
-
-
     def query(self):
 
         # tolist_udf = F.udf(
         #     lambda v: v.toArray().tolist(), 
         #     ArrayType(FloatType())
         # )
-        unlabeled_df_tr = feature_extraction(self.unlabeled_df)\
+        if "features" not in self.df_unlab.columns:
+            df_unlab_tr = feature_extraction(self.df_unlab)\
                             .withColumn("features", tolist_udf("features")) \
-                            .select("*") \
-                            .withColumn("query", self.to_query("features")).cache() \
-                            .filter("query") \
-                            .select("id", "date", "flag", "user", "text")
-        
-        print(unlabeled_df_tr.count())
-        unlabeled_df_tr
+                            .select("*") 
+        else:
+            df_unlab_tr = self.df_unlab 
+
+        df_unlab_tr = df_unlab_tr.withColumn("query", self.to_query("features")).cache() 
+
+
+        df_queried = df_unlab_tr.filter("query") \
+                        .select("id", "date", "flag", "user", "text")
+    
+        self.df_unlab =  df_unlab_tr.filter("NOT query") 
+
+        print("QUERIED: ", df_queried.count())
+        print("REMAIN: ", self.df_unlab.count())
         
         # print("CHUA TRAN RAM")
         
         new_label_df = self.labeler.annotate(
-            unlabeled_df_tr
+            df_queried
         )
-        
-        new_label_df
 
-        return new_label_df.union(df)
+        return new_label_df
 
         # return new_label_df
 
@@ -199,9 +215,7 @@ def log_and_eval_model(best_model, best_params, X_test, y_test):
 
         return (accuracy, f1, loss)
 
-QUERY_FACTOR = 0.1
-TEST_INDEX = 'test-kakfa-ingestion-flow/_doc'
-POOL_INDEX = 'spark_index/doc'
+
 
 df = spark.read.csv(
         'data/training_init.csv',
@@ -240,6 +254,17 @@ learner = ActiveLearner(
 
 print(log_and_eval_model(learner.estimator, trainer.hparams, X_test, y_test))
 
+learner.teach(trainer.X, trainer.y)
+acc,f1,loss = log_and_eval_model(learner.estimator, trainer.hparams, X_test, y_test)
+
+es.index(
+    index = METRIC_INDEX,
+    doc_type = "doc",
+    body = dict(n_new_samples=0, acc=acc, f1=f1, loss=loss),
+    id = 0
+)
+
+
 # Active learning
 strategy = Strategy(
     df,
@@ -247,20 +272,37 @@ strategy = Strategy(
     LabelSimulator('data/label.csv')
 )
 
-new_df = strategy.query()
+QUERY_FACTOR: float
 
-## 
-new_df_tr = feature_extraction(new_df).withColumn("features", tolist_udf("features")).cache()
+while True:
+    try:
+        QUERY_FACTOR = QUERY_AMOUNT / strategy.df_unlab.count()
+
+        new_df = strategy.query()
+
+        ## 
+        new_df_tr = feature_extraction(new_df) \
+                .withColumn("features", tolist_udf("features")) \
+                .cache().toPandas()
+        
+
+        X_new = np.stack(new_df_tr["features"].to_numpy())
+        y_new = new_df_tr["target"].to_numpy()
 
 
-## start training
-trainer = Trainer(
-    new_df_tr.toPandas(), val_size=0.1
-)
-trainer.find_best_lr_model()
+        ## start training
 
-learner = ActiveLearner(
-    estimator=trainer.model,
-)
+        learner.teach(X_new, y_new)
+        
+        n = len(learner.X_training)
+        acc, f1, loss = log_and_eval_model(learner.estimator, trainer.hparams, X_test, y_test)
 
-print(log_and_eval_model(learner.estimator, trainer.hparams, X_test, y_test))
+        es.index(
+            index = METRIC_INDEX,
+            doc_type = "doc",
+            body = dict(n_new_samples=n, acc=acc, f1=f1, loss=loss),
+            id = n
+        )
+
+    except: 
+        break

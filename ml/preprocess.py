@@ -105,9 +105,9 @@ class Preprocessor(
 
 
 def feature_extraction(df):
-    preprocessor = Preprocessor(input_col="text", output_col="text")
+    preprocessor = Preprocessor(input_col="text", output_col="text_clean")
     # Tokenize into words
-    tokenizer = Tokenizer(inputCol="text", outputCol="tokenized")
+    tokenizer = Tokenizer(inputCol="text_clean", outputCol="tokenized")
     # Remove stopwords
     remover = StopWordsRemover(inputCol=tokenizer.getOutputCol(), outputCol="filtered")
     # Compute term frequencies and hash into buckets
