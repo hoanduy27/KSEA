@@ -1,3 +1,5 @@
+
+import math
 from math import sqrt
 import numpy as np
 import mlflow
@@ -13,77 +15,51 @@ from pyspark.sql.dataframe import DataFrame
 from pyspark.sql.types import StringType, ArrayType, FloatType
 import pyspark.sql.functions as F
 
-import math
-
 import pandas as pd
 from modAL.models import ActiveLearner
 from ml.preprocess import feature_extraction
+
+from pyspark.sql import SparkSession
+
+
+spark = SparkSession.Builder() \
+    .appName("data_processor") \
+    .config("spark.jars.packages", "org.elasticsearch:elasticsearch-spark-30_2.12:8.6.2") \
+    .master("local[4]").getOrCreate()
 
 
 tolist_udf = F.udf(lambda v: v.toArray().tolist(), ArrayType(FloatType()))
 
 # def extract_feature(pipeline_model, df):
 #     pipeline_model.transform(df).withColumn("features", tolist_udf("features")).cache()
-
-@pandas_udf("boolean")
-def to_query(features_series, self):
-    X_i = np.stack(features_series.to_numpy())
-    n = X_i.shape[0]
-    query_idx, _ = self.learner.query(X_i, n_instances=math.ceil(n * self.query_factor))
-    # Output has same size of inputs; most instances were not sampled for query
-    query_result = pd.Series([False] * n)
-    # Set True where ActiveLearner wants a label
-    query_result.iloc[query_idx] = True
-    return query_result
+# def to_query(strategy):
 
 class LabelSimulator:
     def __init__(self, label_data_path):
-        self.label_df = pd.read_csv(label_data_path)
-
-    def annotate(self, ids):
-        return self.label_df[self.label_df.isin(ids)].target
-
-
-class Strategy:
-    def __init__(
-            self, 
-            pre_model, 
-            labeled_df: DataFrame, 
-            unlabeled_df: DataFrame, 
-            labeler: LabelSimulator, 
-            query_factor=0.1
-        ):
-        self.pre_model = pre_model
-        self.labeled_df = labeled_df 
-        self.unlabeled_df = unlabeled_df
-        self.learner = ActiveLearner(
-            estimator=pre_model,
+        # self.label_df = pd.read_csv(label_data_path)
+        self.label_df = spark.read.csv(
+            label_data_path,
+            header=True,
+            inferSchema=True
         )
-        self.query_factor = query_factor
 
-    def query(self):
+    def annotate(self, unlabeled_df):
+        # return self.label_df.where(self.label_df['id'].isin(ids)).target
 
-        # tolist_udf = F.udf(
-        #     lambda v: v.toArray().tolist(), 
-        #     ArrayType(FloatType())
-        # )
-        unlabeled_df_tr = feature_extraction(self.unlabeled_df)\
-                            .withColumn("features", tolist_udf("features")) \
-                            .select("*") \
-                            .withColumn("query", to_query("features", self)).cache() \
-                            .filter("query").select("text")
-        
-        print(unlabeled_df_tr.show())
-
+        return self.label_df\
+                .join(unlabeled_df, on=["id", "user"])\
+                .dropDuplicates() \
+                .select("target", "id", "date", "flag", "user", "text")
+        # return self.label_df[self.label_df.isin(ids)].target
+    
 class Trainer:
-    def __init__(self, df, val_size, test_size):
+    def __init__(self, df, val_size):
         self.df = df 
         self.val_size = val_size
-        self.test_size = test_size
         
         (
-            self.X_train, self.X_val, self.X_test, 
-            self.y_train, self.y_val, self.y_test, 
+            self.X_train, self.X_val, 
+            self.y_train, self.y_val, 
         ) = self._split_dataset()
 
         self.hparams = None 
@@ -93,21 +69,14 @@ class Trainer:
         X = np.stack(self.df["features"].to_numpy())
         y = self.df["target"].to_numpy()
 
-        (X_train, X2, y_train, y2) = train_test_split(
+        (X_train, X_val, y_train, y_val) = train_test_split(
             X, y, 
-            test_size= self.val_size + self.test_size, 
+            test_size= self.val_size, 
             stratify=y, 
             random_state=7
         )
 
-        (X_val, X_test, y_val, y_test) = train_test_split(
-            X2,
-            y2,
-            test_size=self.test_size / (self.val_size + self.test_size),
-            stratify=y2,
-            random_state=7,
-        )
-        return (X_train, X_val, X_test, y_train, y_val, y_test)
+        return (X_train, X_val, y_train, y_val)
     
     # Core function to train a model given train set and params
     def train_model(self, params, X_train, y_train):
@@ -159,6 +128,64 @@ class Trainer:
         self.model = final_model
 
 
+class Strategy:
+    def __init__(
+            self, 
+            labeled_df: DataFrame, 
+            unlabeled_df: DataFrame, 
+            labeler: LabelSimulator, 
+        ):
+        # self.pre_model = pre_model
+        self.labeled_df = labeled_df 
+        self.unlabeled_df = unlabeled_df
+        
+        self.labeler = labeler
+
+
+    def to_query(self, features_series):
+        @pandas_udf("boolean")
+        def to_query_(features_series):
+            X_i = np.stack(features_series.to_numpy())
+            n = X_i.shape[0]
+            
+            query_idx, _ = learner.query(X_i, n_instances=math.ceil(n * QUERY_FACTOR))
+            # Output has same size of inputs; most instances were not sampled for query
+            query_result = pd.Series([False] * n)
+            # Set True where ActiveLearner wants a label
+            query_result.iloc[query_idx] = True
+            return query_result
+        
+        return to_query_(features_series)
+
+
+
+    def query(self):
+
+        # tolist_udf = F.udf(
+        #     lambda v: v.toArray().tolist(), 
+        #     ArrayType(FloatType())
+        # )
+        unlabeled_df_tr = feature_extraction(self.unlabeled_df)\
+                            .withColumn("features", tolist_udf("features")) \
+                            .select("*") \
+                            .withColumn("query", self.to_query("features")).cache() \
+                            .filter("query") \
+                            .select("id", "date", "flag", "user", "text")
+        
+        print(unlabeled_df_tr.count())
+        unlabeled_df_tr
+        
+        # print("CHUA TRAN RAM")
+        
+        new_label_df = self.labeler.annotate(
+            unlabeled_df_tr
+        )
+        
+        new_label_df
+
+        return new_label_df.union(df)
+
+        # return new_label_df
 
 
 def log_and_eval_model(best_model, best_params, X_test, y_test):
@@ -169,49 +196,71 @@ def log_and_eval_model(best_model, best_params, X_test, y_test):
         mlflow.log_params(best_params)
         mlflow.log_metrics({"accuracy": accuracy, "log_loss": loss})
         mlflow.sklearn.log_model(best_model, "model")
+
         return (accuracy, f1, loss)
 
-if __name__ == "__main__":
-    from pyspark.sql import SparkSession
+QUERY_FACTOR = 0.1
+TEST_INDEX = 'test-kakfa-ingestion-flow/_doc'
+POOL_INDEX = 'spark_index/doc'
 
-    spark = SparkSession.Builder() \
-        .appName("data_processor") \
-        .config("spark.jars.packages", "org.elasticsearch:elasticsearch-spark-30_2.12:8.6.2") \
-        .master("local[4]").getOrCreate()
-
-    # df = spark.read.format('csv').option('header', 'true').load(
-    #     'data/complaints_init.csv'
-    # )
-
-    df = spark.read.csv(
+df = spark.read.csv(
         'data/training_init.csv',
         header=True,
         inferSchema=True    
-    )
+)
 
-    df_unlab = spark.read.csv(
-        'data/training_sorted.csv',
-        header=True,
-        inferSchema=True
-    )
+df_unlab = spark.read.format("org.elasticsearch.spark.sql") \
+                .option("es_resource", POOL_INDEX) \
+                .load().drop("target")
 
-    df_unlab.sample(0.01)
+df_test = spark.read.format("org.elasticsearch.spark.sql") \
+                .option("es_resource", TEST_INDEX).load()
 
-    df_tr = feature_extraction(df).withColumn("features", tolist_udf("features")).cache()
+# train init model
 
-    trainer = Trainer(
-        df_tr.toPandas(), 0.1, 0.1
-    )
+## feat extract
+df_tr = feature_extraction(df)\
+            .withColumn("features", tolist_udf("features")).cache()
+df_test_tr = feature_extraction(df_test)\
+                .withColumn("features", tolist_udf("features")).cache()\
+                .toPandas()
 
-    trainer.find_best_lr_model()
+X_test = np.stack(df_test_tr["features"].to_numpy())
+y_test = df_test_tr["target"].to_numpy()
 
-    print(log_and_eval_model(trainer.model, trainer.hparams, trainer.X_test, trainer.y_test))
+## start training
+trainer = Trainer(
+    df_tr.toPandas(), val_size=0.1
+)
+trainer.find_best_lr_model()
 
-    strategy = Strategy(
-        trainer.model,
-        df,
-        df_unlab,
-        None
-    )
+learner = ActiveLearner(
+    estimator=trainer.model,
+)
 
-    strategy.query()
+print(log_and_eval_model(learner.estimator, trainer.hparams, X_test, y_test))
+
+# Active learning
+strategy = Strategy(
+    df,
+    df_unlab,
+    LabelSimulator('data/label.csv')
+)
+
+new_df = strategy.query()
+
+## 
+new_df_tr = feature_extraction(new_df).withColumn("features", tolist_udf("features")).cache()
+
+
+## start training
+trainer = Trainer(
+    new_df_tr.toPandas(), val_size=0.1
+)
+trainer.find_best_lr_model()
+
+learner = ActiveLearner(
+    estimator=trainer.model,
+)
+
+print(log_and_eval_model(learner.estimator, trainer.hparams, X_test, y_test))

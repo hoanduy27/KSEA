@@ -22,8 +22,10 @@ consumer = KafkaConsumer(
 )
 
 for message in consumer:
+  print(message.value['id'])
   es.index(
     index=ES_INDEX_NAME,
     body=message.value,
-    doc_type='_doc'
+    doc_type='_doc',
+    id = message.value['id']
   )
