@@ -58,3 +58,9 @@ The active learning flow consists of 3 steps:
     ```
         python3 -m ml.trainer
     ```
+
+6. Model Performance Visualization
+    - Open Kibana at `localhost:5601`
+    - Go to **Management** > **Kibana** > **Saved Objects**
+    - Click **Import** then upload the file `model_performance_visualization.ndjson`
+    
