@@ -6,7 +6,7 @@ import mlflow
 import mlflow.sklearn
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, log_loss, f1_score
+from sklearn.metrics import accuracy_score, log_loss, f1_score, precision_score, recall_score
 from hyperopt import fmin, hp, tpe
 from hyperopt import SparkTrials, STATUS_OK
 
@@ -23,7 +23,7 @@ from pyspark.sql import SparkSession
 from elasticsearch import Elasticsearch
 
 
-QUERY_AMOUNT = 10000
+QUERY_AMOUNT = 5000
 TEST_INDEX = 'test-kakfa-ingestion-flow/_doc'
 POOL_INDEX = 'spark_index/doc'
 METRIC_INDEX = 'active_learning_performance'
@@ -110,8 +110,8 @@ class Trainer:
             accuracy = accuracy_score(self.y_val, lr.predict(self.X_val))
             f1 = f1_score(self.y_val, lr.predict(self.X_val), pos_label=4)
             # supplement auto logging in mlflow with f1 and accuracy
-            mlflow.log_metric("f1", f1)
-            mlflow.log_metric("accuracy", accuracy)
+            # mlflow.log_metric("f1", f1)
+            # mlflow.log_metric("accuracy", accuracy)
             return {"status": STATUS_OK, "loss": loss, "accuracy": accuracy, "f1": f1}
 
         # penalties = ["l1", "l2", "elasticnet"]
@@ -205,15 +205,20 @@ class Strategy:
 
 
 def log_and_eval_model(best_model, best_params, X_test, y_test):
-    with mlflow.start_run():
-        accuracy = accuracy_score(y_test, best_model.predict(X_test))
-        f1 = f1_score(y_test, best_model.predict(X_test), pos_label=4)
-        loss = log_loss(y_test, best_model.predict_proba(X_test))
-        mlflow.log_params(best_params)
-        mlflow.log_metrics({"accuracy": accuracy, "log_loss": loss})
-        mlflow.sklearn.log_model(best_model, "model")
+    # with mlflow.start_run():
+    y_pred = best_model.predict(X_test)
 
-        return (accuracy, f1, loss)
+    accuracy = accuracy_score(y_test, y_pred)
+    f1_neg = f1_score(y_test, y_pred, pos_label=0)
+    f1_pos = f1_score(y_test, y_pred, pos_label=4)
+    loss = log_loss(y_test, best_model.predict_proba(X_test))
+    
+
+    # mlflow.log_params(best_params)
+    # mlflow.log_metrics({"accuracy": accuracy, "log_loss": loss})
+    # mlflow.sklearn.log_model(best_model, "model")
+
+    return (accuracy, f1_neg, f1_pos, loss)
 
 
 
@@ -255,13 +260,19 @@ learner = ActiveLearner(
 print(log_and_eval_model(learner.estimator, trainer.hparams, X_test, y_test))
 
 learner.teach(trainer.X, trainer.y)
-acc,f1,loss = log_and_eval_model(learner.estimator, trainer.hparams, X_test, y_test)
+acc,f1_neg, f1_pos ,loss = log_and_eval_model(learner.estimator, trainer.hparams, X_test, y_test)
 
 es.index(
     index = METRIC_INDEX,
     doc_type = "doc",
-    body = dict(n_new_samples=0, acc=acc, f1=f1, loss=loss),
-    id = 0
+    body = dict(
+        n_new_samples=len(learner.X_training), 
+        acc=acc, 
+        f1_neg=f1_neg, 
+        f1_pos=f1_pos, 
+        loss=loss
+    ),
+    id = len(learner.X_training)
 )
 
 
@@ -295,14 +306,21 @@ while True:
         learner.teach(X_new, y_new)
         
         n = len(learner.X_training)
-        acc, f1, loss = log_and_eval_model(learner.estimator, trainer.hparams, X_test, y_test)
+        acc,f1_neg, f1_pos ,loss = log_and_eval_model(learner.estimator, trainer.hparams, X_test, y_test)
 
         es.index(
             index = METRIC_INDEX,
             doc_type = "doc",
-            body = dict(n_new_samples=n, acc=acc, f1=f1, loss=loss),
+            body = dict(
+                n_new_samples=n, 
+                acc=acc, 
+                f1_neg=f1_neg, 
+                f1_pos=f1_pos, 
+                loss=loss
+            ),
             id = n
         )
 
-    except: 
+    except Exception as e:
+        print(e) 
         break
