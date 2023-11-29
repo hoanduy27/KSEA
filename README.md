@@ -1,4 +1,8 @@
-# -SDH-231-BigData
+# KSEA
+
+Implementation of project **Leveraging Kafka, ElasticSearch, and Spark for Active Learning and Visualization** in **Big Data course (CO5153)**.
+
+Team: HappyPos
 
 | Service  | Address | Note| 
 | ------------- | ------------- | --|
